@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AR Stickers (marcador + contorno + dedo)</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; font-family: system-ui, sans-serif; }
+  #mind { position: fixed; inset: 0; opacity: .01; pointer-events: none; z-index: 0; }  /* MindAR corre aqui, escondido */
+  #stage { position: fixed; inset: 0; touch-action: none; z-index: 1; }
+  #wrap { position: absolute; left: 50%; top: 50%; transform-origin: 0 0; }
+  video, svg { position: absolute; left: 0; top: 0; width: 100%; height: 100%; }
+  #stickers { position: absolute; left: 0; top: 0; transition: opacity .2s; }
+  .s { position: absolute; left: 0; top: 0; width: 100px; height: 100px; transform-origin: 0 0; }
+  .s img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 10px; align-items: center; justify-content: center;
+         padding: 12px; padding-bottom: calc(12px + env(safe-area-inset-bottom, 0px)); color: #fff;
+         background: rgba(0,0,0,.5); z-index: 5; }
+  button { font: inherit; padding: 8px 14px; border-radius: 8px; border: 0; }
+</style>
+<script type="importmap">
+{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.147.0/build/three.module.js",
+    "mindar-image-three": "https://cdn.jsdelivr.net/npm/mind-ar@1.2.5/dist/mindar-image-three.prod.js"
+} }
+</script>
+</head>
+<body>
+<div id="mind"></div>
+<div id="stage"><div id="wrap">
+  <video id="v" playsinline muted autoplay></video>
+  <svg id="svg"><polygon id="poly" fill="rgba(0,255,120,.12)" stroke="#0f8" stroke-width="3"/>
+    <circle id="ring" r="30" fill="none" stroke="#0f8" stroke-width="7" stroke-linecap="round" style="display:none"/>
+    <circle id="dot" r="8" fill="#ff0" style="display:none"/></svg>
+  <div id="stickers"></div>
+</div></div>
+<div id="hud"><span id="info">A carregar OpenCV…</span>
+  <button id="outline">Contorno</button><button id="reset">Recomeçar</button></div>
+
+<script async src="https://docs.opencv.org/4.x/opencv.js" onload="window.opencvLoaded && opencvLoaded()"></script>
+<script type="module">
+import * as THREE from 'three';
+import { MindARThree } from 'mindar-image-three';
+
+// ---- Configuração ----
+// Marcador (imagem do target.mind) pousado na mesa, À ESQUERDA do portátil, ambos "direitos" (como os vês sentado)
+const MARKER_W_CM = 10;        // largura impressa do marcador, em cm
+const MARKER_ASPECT = 0.66;    // altura / largura do marcador
+const GAP_CM = 15;              // distância entre a borda direita do marcador e a borda esquerda do portátil
+const TOP_OFFSET_CM = 0;       // quanto o topo do portátil está abaixo do topo do marcador (0 = alinhados)
+const LW = 35.5, LH = 26.5;            // portátil em cm (largura x profundidade)
+const STICKER_CM = 4.5;                // tamanho do sticker
+// Imagens numeradas 1..10 na pasta "stickers" (stickers/1.png ... stickers/10.png). Muda a extensão se for preciso.
+const EXT = 'png';
+const FILES = Array.from({ length: 10 }, (_, i) => `stickers/${i + 1}.${EXT}`);
+FILES.forEach(f => { new Image().src = f; });   // pré-carrega
+const PW = 320;                        // largura de processamento (menor = mais rápido)
+const DWELL_MS = 500;                  // tempo com o dedo parado para "colar"
+const HOLD_CM = 1.5;                   // quanto o dedo pode mexer e ainda contar como parado
+const REARM_CM = 4;                    // distância a afastar o dedo antes de poder colar outro
+const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task';
+
+const $ = id => document.getElementById(id);
+const video = $('v'), wrap = $('wrap'), info = $('info'), poly = $('poly'), stickersEl = $('stickers');
+let vw, vh, PH, K, ctx, running = false, showOutline = true;
+let src, gray, bin, kernel, ksz, contours, hier;
+let prev = null, lost = 99, Hm = null, Hinv = null, hands = null, markerOn = false;
+
+// ---- MindAR (só para calibrar: dá a pose do marcador) ----
+const mindEl = document.getElementById('mind');
+const mindar = new MindARThree({ container: mindEl, imageTargetSrc: './target.mind', uiLoading: 'no', uiScanning: 'no', uiError: 'no' });
+const anchor = mindar.addAnchor(0);
+anchor.onTargetFound = () => { markerOn = true; };
+anchor.onTargetLost = () => { markerOn = false; };
+const _v = new THREE.Vector3();
+
+// ponto (cm, no plano do marcador, origem no centro, y para cima) -> pixel do vídeo
+function project(xcm, ycm) {
+  _v.set(xcm / MARKER_W_CM, ycm / MARKER_W_CM, 0).applyMatrix4(anchor.group.matrixWorld).project(mindar.camera);
+  const vid = mindar.video, cw = mindEl.clientWidth, ch = mindEl.clientHeight;
+  const vr = vid.videoWidth / vid.videoHeight;
+  const dw = vr > cw / ch ? ch * vr : cw, dh = vr > cw / ch ? ch : cw / vr;   // vídeo "cover" no contentor
+  const cx = (_v.x + 1) / 2 * cw, cy = (1 - _v.y) / 2 * ch;
+  return [(cx + (dw - cw) / 2) * vid.videoWidth / dw, (cy + (dh - ch) / 2) * vid.videoHeight / dh];
+}
+function markerCorners() {   // 4 cantos do portátil (TL, TR, BR, BL) em pixéis do vídeo, a partir do marcador
+  anchor.group.updateWorldMatrix(true, false);
+  const x0 = MARKER_W_CM / 2 + GAP_CM, y0 = MARKER_W_CM * MARKER_ASPECT / 2 - TOP_OFFSET_CM;
+  return [[x0, y0], [x0 + LW, y0], [x0 + LW, y0 - LH], [x0, y0 - LH]].map(p => project(p[0], p[1]));
+}
+const stickers = [];
+
+// ---- Matemática 3x3 (row-major) ----
+const mul3 = (a, b) => { const r = []; for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++)
+  r.push(a[i*3]*b[j] + a[i*3+1]*b[3+j] + a[i*3+2]*b[6+j]); return r; };
+function inv3(m) {
+  const [a,b,c,d,e,f,g,h,i] = m, A = e*i-f*h, B = -(d*i-f*g), C = d*h-e*g, det = a*A + b*B + c*C;
+  return [A, -(b*i-c*h), b*f-c*e, B, a*i-c*g, -(a*f-c*d), C, -(a*h-b*g), a*e-b*d].map(x => x / det);
+}
+const applyH = (M, x, y) => { const w = M[6]*x + M[7]*y + M[8];
+  return [(M[0]*x + M[1]*y + M[2]) / w, (M[3]*x + M[4]*y + M[5]) / w]; };
+const dist = (a, b) => Math.hypot(a[0]-b[0], a[1]-b[1]);
+const rot = (arr, r) => arr.slice(r).concat(arr.slice(0, r));
+
+// ---- Arranque ----
+function opencvLoaded() {
+  const go = () => { info.textContent = 'A abrir a câmara…'; startCamera(); };
+  if (window.cv instanceof Promise) cv.then(m => { window.cv = m; go(); });
+  else if (cv.Mat) go();
+  else cv.onRuntimeInitialized = go;
+}
+async function startCamera() {
+  try {
+    await mindar.start();                                   // abre a câmara e carrega o target.mind
+    video.srcObject = mindar.video.srcObject; await video.play();
+  } catch (e) { info.textContent = 'Sem câmara ou target.mind (precisa de HTTPS, permissão e o ficheiro).'; return; }
+  await new Promise(r => video.videoWidth ? r() : video.addEventListener('loadedmetadata', r, { once: true }));
+  vw = video.videoWidth; vh = video.videoHeight; PH = Math.round(PW * vh / vw); K = vw / PW;
+  wrap.style.width = vw + 'px'; wrap.style.height = vh + 'px';
+  $('svg').setAttribute('viewBox', `0 0 ${vw} ${vh}`);
+  stickersEl.style.width = vw + 'px'; stickersEl.style.height = vh + 'px';
+  const cv2 = document.createElement('canvas'); cv2.width = PW; cv2.height = PH;
+  ctx = cv2.getContext('2d', { willReadFrequently: true });
+  src = new cv.Mat(PH, PW, cv.CV_8UC4); gray = new cv.Mat(); bin = new cv.Mat();
+  kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(9, 9)); ksz = new cv.Size(5, 5);
+  contours = new cv.MatVector(); hier = new cv.Mat();
+  fit(); addEventListener('resize', fit);
+  info.textContent = 'A carregar deteção de mãos…';
+  try {
+    const { HandLandmarker, FilesetResolver } = await import(MP + '/vision_bundle.mjs');
+    const fileset = await FilesetResolver.forVisionTasks(MP + '/wasm');
+    const opts = d => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: 'VIDEO', numHands: 1 });
+    try { hands = await HandLandmarker.createFromOptions(fileset, opts('GPU')); }
+    catch (e) { hands = await HandLandmarker.createFromOptions(fileset, opts('CPU')); }
+  } catch (e) { info.textContent = 'Falhou a carregar o MediaPipe (rede?).'; return; }
+  running = true; loop();
+}
+function fit() {
+  const s = Math.min(innerWidth / vw, innerHeight / vh);
+  wrap.style.transform = `scale(${s}) translate(${-vw / 2}px, ${-vh / 2}px)`;
+}
+
+// ---- Deteção do portátil (escuro) sobre a mesa (castanha) ----
+function detect() {
+  ctx.drawImage(video, 0, 0, PW, PH);
+  src.data.set(ctx.getImageData(0, 0, PW, PH).data);
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  cv.GaussianBlur(gray, gray, ksz, 0);
+  cv.threshold(gray, bin, 0, 255, cv.THRESH_BINARY_INV | cv.THRESH_OTSU);  // escuro = branco
+  cv.morphologyEx(bin, bin, cv.MORPH_CLOSE, kernel);                       // tapa reflexos/buracos
+  cv.findContours(bin, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+
+  let best = -1, bestA = 0;
+  for (let i = 0; i < contours.size(); i++) {
+    const c = contours.get(i), a = cv.contourArea(c); c.delete();
+    if (a > bestA) { bestA = a; best = i; }
+  }
+  const frac = bestA / (PW * PH);
+  if (best < 0 || frac < 0.05 || frac > 0.9) return null;
+
+  const c = contours.get(best), hull = new cv.Mat();
+  cv.convexHull(c, hull, false, true);
+  const per = cv.arcLength(hull, true);
+  let pts = null;
+  for (const e of [0.02, 0.035, 0.05, 0.07]) {
+    const ap = new cv.Mat(); cv.approxPolyDP(hull, ap, e * per, true);
+    if (ap.rows === 4) { pts = Array.from(ap.data32S); ap.delete(); break; }
+    ap.delete();
+  }
+  c.delete(); hull.delete();
+  if (!pts) return null;
+
+  let q = [0, 2, 4, 6].map(i => [pts[i] * K, pts[i + 1] * K]);
+  const area = q.reduce((s, p, i) => { const n = q[(i + 1) % 4]; return s + p[0]*n[1] - n[0]*p[1]; }, 0);
+  if (area < 0) q.reverse();                                  // sentido horário (TL, TR, BR, BL)
+
+  const hLen = dist(q[0], q[1]) + dist(q[3], q[2]), vLen = dist(q[0], q[3]) + dist(q[1], q[2]);
+  const ratio = Math.max(hLen, vLen) / Math.min(hLen, vLen);
+  if (ratio < 1.0 || ratio > 2.4) return null;                // forma implausível
+
+  if (prev && lost < 20) {                                    // continuidade: mantém a mesma orientação
+    let bestR = 0, bestD = Infinity;
+    for (let r = 0; r < 4; r++) { const t = rot(q, r); const d = t.reduce((s, p, i) => s + dist(p, prev[i]), 0);
+      if (d < bestD) { bestD = d; bestR = r; } }
+    q = rot(q, bestR);
+    q = q.map((p, i) => [prev[i][0] + 0.5 * (p[0] - prev[i][0]), prev[i][1] + 0.5 * (p[1] - prev[i][1])]);
+  } else {                                                    // 1.ª vez: começa no canto mais "alto-esquerdo"
+    let k = 0; q.forEach((p, i) => { if (p[0] + p[1] < q[k][0] + q[k][1]) k = i; });
+    q = rot(q, k);
+    const longIsH = dist(q[0], q[1]) + dist(q[3], q[2]) > dist(q[0], q[3]) + dist(q[1], q[2]);
+    if (longIsH !== (LW > LH)) q = rot(q, 1);                 // lado maior = largura do portátil
+  }
+  return q;
+}
+
+function updateH(q) {
+  const s = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, LW, 0, LW, LH, 0, LH]);
+  const d = cv.matFromArray(4, 1, cv.CV_32FC2, q.flat());
+  const m = cv.getPerspectiveTransform(s, d);
+  Hm = Array.from(m.data64F); Hinv = inv3(Hm);
+  s.delete(); d.delete(); m.delete();
+}
+
+function place(st) {   // matrix3d: sticker (px locais) -> cm do portátil -> imagem
+  const S = 100, s = STICKER_CM / S, h = STICKER_CM / 2, c = Math.cos(st.rot), n = Math.sin(st.rot);
+  const A = [c*s, -n*s, st.x - c*h + n*h,  n*s, c*s, st.y - n*h - c*h,  0, 0, 1];
+  const M = mul3(Hm, A), w = M[8];
+  st.el.style.transform = `matrix3d(${M[0]/w},${M[3]/w},0,${M[6]/w},${M[1]/w},${M[4]/w},0,${M[7]/w},0,0,1,0,${M[2]/w},${M[5]/w},0,1)`;
+}
+
+// ---- Adicionar sticker ----
+function addSticker(x, y) {
+  const el = document.createElement('div'); el.className = 's';
+  el.innerHTML = `<img src="${FILES[stickers.length]}" alt="">`;
+  stickersEl.appendChild(el);
+  stickers.push({ el, x, y, rot: (Math.random() - 0.5) * 0.6 });
+}
+
+// ---- Lógica do "toque": dedo parado dentro do portátil ----
+const ring = $('ring'), dot = $('dot'), CIRC = 2 * Math.PI * 30;
+let anchorPt = null, since = 0, armed = true, lastPlaced = null, lastSeen = 0;
+let tipPx = null, frame = 0, lastT = -1;
+
+function fingerLogic(tip, px) {
+  const now = performance.now();
+  dot.style.display = px ? '' : 'none';
+  if (px) { dot.setAttribute('cx', px[0]); dot.setAttribute('cy', px[1]); lastSeen = now; }
+  const inside = tip && tip[0] >= 0 && tip[0] <= LW && tip[1] >= 0 && tip[1] <= LH;
+  let progress = null;
+  if (!px) { anchorPt = null; if (now - lastSeen > 600) armed = true; }
+  else if (!inside) { anchorPt = null; armed = true; }
+  else if (!armed) { if (dist(tip, lastPlaced) > REARM_CM) armed = true; }
+  else if (stickers.length < FILES.length) {
+    if (!anchorPt || dist(tip, anchorPt) > HOLD_CM) { anchorPt = tip; since = now; }
+    progress = Math.min(1, (now - since) / DWELL_MS);
+    if (progress >= 1) { addSticker(anchorPt[0], anchorPt[1]); lastPlaced = anchorPt; armed = false; anchorPt = null; progress = null; }
+  }
+  if (progress === null) ring.style.display = 'none';
+  else {
+    ring.style.display = '';
+    ring.setAttribute('cx', px[0]); ring.setAttribute('cy', px[1]);
+    ring.setAttribute('transform', `rotate(-90 ${px[0]} ${px[1]})`);
+    ring.setAttribute('stroke-dasharray', `${progress * CIRC} ${CIRC}`);
+  }
+}
+
+function loop() {
+  requestAnimationFrame(loop);
+  if (markerOn) {                                             // 1) marcador visível: posição exata
+    const q = markerCorners();
+    if (q.every(p => isFinite(p[0]) && isFinite(p[1]))) { prev = q; lost = 0; updateH(q); }
+  } else if (frame++ % 2 === 0) {                             // 2) sem marcador: segue o contorno escuro
+    const q = detect();
+    if (q) { prev = q; lost = 0; updateH(q); } else lost++;
+  }
+  const ok = prev && lost < 10;
+  stickersEl.style.opacity = ok ? 1 : 0;
+  poly.style.display = ok && showOutline ? '' : 'none';
+  if (ok) { poly.setAttribute('points', prev.map(p => p.join(',')).join(' ')); stickers.forEach(place); }
+
+  if (video.currentTime !== lastT) {                          // mão: a cada frame novo de vídeo
+    lastT = video.currentTime;
+    const lm = hands.detectForVideo(video, performance.now()).landmarks[0];
+    tipPx = lm ? [lm[8].x * vw, lm[8].y * vh] : null;         // ponta do indicador
+  }
+  const tipCm = ok && tipPx ? applyH(Hinv, tipPx[0], tipPx[1]) : null;
+  fingerLogic(tipCm, ok ? tipPx : null);
+
+  info.textContent = !ok ? 'Mostra o marcador à câmara (ou o portátil inteiro)…'
+    : stickers.length >= FILES.length ? 'Todos colados! Carrega em Recomeçar.'
+    : `Stickers: ${stickers.length}/${FILES.length} — pousa o indicador no portátil e fica parado (${markerOn ? 'marcador' : 'contorno'})`;
+}
+
+$('reset').onclick = () => { stickers.forEach(s => s.el.remove()); stickers.length = 0; };
+$('outline').onclick = () => showOutline = !showOutline;
+window.opencvLoaded = opencvLoaded;
+if (window.cv) opencvLoaded();   // caso o OpenCV tenha carregado antes deste módulo
+</script>
+</body>
+</html>
